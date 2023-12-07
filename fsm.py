@@ -156,8 +156,9 @@ def receiveDataPacket(pkt):
         """ Corrupt: drop """
         # (still send sack, but effectively only cumulative ack)
         sendSACK(ack_seq_num=base-1, sack_seq_num=base-1, is_fin=False)
-    if pkt.seq_num == base:
+    elif pkt.seq_num == base:
         """ In-order """
+        markSACK(pkt.seq_num)
         updateBase()
         sendSACK(ack_seq_num=base-1, sack_seq_num=pkt.seq_num, is_fin=pkt.fin)
         if isAllReceived():
