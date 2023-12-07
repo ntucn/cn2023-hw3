@@ -17,6 +17,16 @@
     
     To remove colors / convert to pure text, use something like this
         $ python ...  | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2};?)?)?[mGK]//g"
+
+    NOTE: If you send >2.5MB file with error rate 0, there might be a case where checkCoherency failed
+          because e.g. the thing agent sends will not be received by sender.
+
+          Maybe the buffer from linux's socket is itself doing drop due to buffer overflow
+          It happens quite regularly, whenever the sender/receiver do ~2500 segments this will happen.
+          Still, if this happens, timeout + cumulative ack should be able to recover from this and treat
+          it as error rate rate > 0.
+          
+          TL;DR: Send big file with error rate 0 might still have loss.
 """
 
 from log_parser import *
@@ -36,6 +46,8 @@ def toColor(s: str, color: str, other: str = ""):
     # if not sys.stdout.isatty():
     #     # redirected, disable color
     #     return s
+    if getattr(toColor, 'disable_color', False):
+        return s
     return f'{getattr(colorama.Fore, color.upper())}{str(s)}{colorama.Style.RESET_ALL}'
 
 def printLogError(sender_error, receiver_error, agent_error):
@@ -159,13 +171,13 @@ class TestClass:
             getattr(self, method)()
             
             if self.isFailed():
-                result_ls.append(toColor(method, "red"))
+                result_ls.append(toColor(f'{method}[X]', "red"))
                 return_ls.append((method, True))
                 print(toColor(f"[x] Test failed: total fail count {len(self.fail_ls)}", "red"))
                 for f in self.fail_ls:
                     print(f"    [-] {colorLineNumber(f)}")
             else:
-                result_ls.append(toColor(method, "green"))
+                result_ls.append(toColor(f'{method}[O]', "green"))
                 return_ls.append((method, False))
                 print(toColor(f"[o] Test succeeded!", "green"))
         
@@ -226,7 +238,7 @@ class LogTest(TestClass):
         return f'{match[0].__name__}({", ".join([f"{key}={attr}" for key, attr in match[1].items()])})'
 
     def _failMatchLogStr(self, log_name: str, start_line: int, item_ls: List[LogDataclass], match_ls: List[Match]):
-        return f'Lines {log_name}:{start_line}~{start_line + len(item_ls) - 1}: Mismatch: ' \
+        return f'Line {log_name}:{start_line}~{start_line + len(item_ls) - 1}: Mismatch: ' \
                f'{item_ls} should match [{", ".join([self._matchToStr(m) for m in match_ls])}]'
     
     def checkAgentFormat(self):
@@ -294,20 +306,13 @@ class LogTest(TestClass):
                     self.fail(f'Line receiver:{i+1}: Unexpected {cur_item}')
                 i += 1
 
-            elif isinstance(cur_item, DropData):
-                # drop data -> send ack
-                item_ls = self.receiver_log[i:i+2]
-                match_ls = [(DropData, {'seq_num': cur_item.seq_num}), (SendAck, {'sack': cur_item.seq_num})]
-                if not checkMatch(item_ls, match_ls):
-                    self.fail(self._failMatchLogStr("receiver", i+1, item_ls, match_ls))
-                i += 2
-
             elif isinstance(cur_item, RecvData):
                 # recv data -> send ack (-> flush -> sha256)
                 item_ls = self.receiver_log[i:i+4]
                 match_ls = [
-                    (RecvData, {}), (SendAck, {}), (Flush, {}), (Sha256, {}), 
+                    (RecvData, {'is_dropped': False}), (SendAck, {}), (Flush, {}), (Sha256, {}), 
                 ]
+
                 if checkMatch(item_ls, match_ls):
                     i += 4
                     continue
@@ -316,8 +321,16 @@ class LogTest(TestClass):
                     i += 2
                     continue
 
+                match_ls = [
+                    (RecvData, {'is_dropped': True}), (SendAck, {}) 
+                ]
+                if checkMatch(item_ls[:2], match_ls):
+                    i += 2
+                    continue
+                
+
                 self.fail(
-                    f'Line receiver:{i+1}: Expected to match [RecvData, SendAck] or [RecvData, SendAck, Flush, Sha256], '
+                    f'Line receiver:{i+1}: Expected to match [RecvData, SendAck] or [RecvData(is_dropped=False), SendAck, Flush, Sha256], '
                     f'but get {item_ls} instead'
                 )
                 i += 1      # don't know how to jump now, it may output a lot of error message for some time
@@ -347,6 +360,7 @@ class LogTest(TestClass):
                 2. every ack packet forwarded by agent should be gotten by sender
                 3. every ack packet receiver sends should be gotten by agent
                 4. every data packet agent forwards should be gotten by receiver
+                5. every data packet agent corrupts should be gotten as corrupt by receiver
         """
         def matchDataPacket(msg, a_ls, b_ls):
             for (a_i, a), (b_i, b) in zip(a_ls, b_ls):
@@ -379,6 +393,17 @@ class LogTest(TestClass):
         receiver_data = [(f'receiver:{i+1}', log) for i, log in enumerate(self.receiver_log) if isinstance(log, RecvData)]
         agent_fwd = [(f'agent:{i+1}', log) for i, log in enumerate(self.agent_log) if isinstance(log, (FwdData, CorruptData))]
         matchDataPacket('Receiver/Agent data segment coherency', receiver_data, agent_fwd)
+
+        # 5. every data packet agent corrupts should be gotten as corrupt by receiver
+        receiver_data = [
+            (f'receiver:{i+1}', log) for i, log in enumerate(self.receiver_log) 
+            if isinstance(log, RecvData) and log.is_dropped == True and log.comment == 'corrupted'
+        ]
+        agent_fwd = [
+            (f'agent:{i+1}', log) for i, log in enumerate(self.agent_log) 
+            if isinstance(log, CorruptData)
+        ]
+        matchDataPacket('Receiver/Agent corruption coherency', receiver_data, agent_fwd)
     
     def checkSenderResnd(self):
         """
