@@ -82,6 +82,7 @@ def newACK(pkt):
     """ 
         get new ack, i.e. ackNumber > base
     """
+    dup_ack = 0
     markSACK(pkt.sack_num)
     updateBase(pkt.ack_num)
     if isAtState(SlowStart):
